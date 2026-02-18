@@ -402,22 +402,44 @@ def _parse_wargoal(node: Dict[str, Any]) -> Wargoal:
     )
 
 
+def _iter_dict_nodes(node: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(node, dict):
+        yield node
+        for v in node.values():
+            yield from _iter_dict_nodes(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _iter_dict_nodes(v)
+
+
 def _collect_history_dates(history_node: Any) -> List[Tuple[str, Dict[str, Any]]]:
     out: List[Tuple[str, Dict[str, Any]]] = []
-    if not isinstance(history_node, dict):
-        return out
-    for k, v in history_node.items():
-        if isinstance(k, str) and re.fullmatch(r"\d{3,4}\.\d{1,2}\.\d{1,2}", k):
-            if isinstance(v, dict):
-                out.append((k, v))
-            else:
-                out.append((k, {"value": v}))
+    for d in _iter_dict_nodes(history_node):
+        for k, v in d.items():
+            if isinstance(k, str) and re.fullmatch(r"\d{3,4}\.\d{1,2}\.\d{1,2}", k):
+                if isinstance(v, dict):
+                    out.append((k, v))
+                elif isinstance(v, list):
+                    out.append((k, {"entries": v}))
+                else:
+                    out.append((k, {"value": v}))
+
     out.sort(key=lambda t: t[0])
-    return out
+
+    # Deduplicate exact duplicates while preserving order.
+    seen = set()
+    unique: List[Tuple[str, Dict[str, Any]]] = []
+    for date_key, ev in out:
+        key = (date_key, tuple(sorted(ev.keys())))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((date_key, ev))
+    return unique
 
 
-def _infer_outcome(node: Dict[str, Any], history_events: List[Tuple[str, Dict[str, Any]]]) -> str:
-    direct = _first_non_empty(node, "outcome", "result", "winner", "victor", "peace_term")
+def _infer_outcome(node: Dict[str, Any], history_events: List[Tuple[str, Dict[str, Any]]], end_date: str) -> str:
+    direct = _first_non_empty(node, "outcome", "result", "winner", "victor", "peace_term", "status")
     if direct:
         return str(direct)
 
@@ -431,37 +453,118 @@ def _infer_outcome(node: Dict[str, Any], history_events: List[Tuple[str, Dict[st
             return "annexation"
         if "humiliate" in combined:
             return "humiliation"
-        if "add_attacker" in lowered_keys or "add_defender" in lowered_keys:
-            continue
+        if "victory" in combined or "won" in combined:
+            return "victory"
+        if "defeat" in combined or "lost" in combined:
+            return "defeat"
         if "rem_attacker" in lowered_keys or "rem_defender" in lowered_keys or "end_war" in combined:
             return "ended"
-    return "unknown"
+
+    if end_date:
+        return "ended"
+    return "ongoing"
+
+
+def _looks_like_battle_dict(node: Dict[str, Any]) -> bool:
+    keys = {str(k).lower() for k in node.keys()}
+    if "battle" in " ".join(keys) or "combat" in " ".join(keys):
+        return True
+    if ("attacker" in keys or "attacking_country" in keys) and ("defender" in keys or "defending_country" in keys):
+        return True
+    if ("attacker_losses" in keys or "defender_losses" in keys or "losses_attacker" in keys or "losses_defender" in keys):
+        return True
+    return False
 
 
 def _collect_war_battles(node: Dict[str, Any], history_events: List[Tuple[str, Dict[str, Any]]]) -> List[Battle]:
     battles: List[Battle] = []
 
-    for b in _as_list(_first_non_empty(node, "battles", "battle", "combat", "combats", "engagements")):
+    # Direct/known containers.
+    for b in _as_list(_first_non_empty(node, "battles", "battle", "combat", "combats", "engagements", "fight")):
         if isinstance(b, dict):
-            sub_values = list(b.values()) if any(isinstance(v, dict) for v in b.values()) else [b]
-            for item in sub_values:
-                if isinstance(item, dict):
-                    battles.append(_parse_battle(item))
+            for sub in _iter_dict_nodes(b):
+                if _looks_like_battle_dict(sub):
+                    battles.append(_parse_battle(sub))
 
-    # Some saves store combat snippets in war history date entries.
-    if not battles:
-        for date_key, ev in history_events:
-            keys = {str(k).lower() for k in ev.keys()}
-            if not ({"attacker", "defender"} & keys):
-                continue
-            if not any("loss" in k or "casual" in k or "battle" in k or "combat" in k for k in keys):
-                continue
-            entry = dict(ev)
-            entry.setdefault("date", date_key)
-            battles.append(_parse_battle(entry))
+    # History events frequently contain battle snippets.
+    for date_key, ev in history_events:
+        if _looks_like_battle_dict(ev):
+            # Wrapper style: { battle={...} } / { combat={...} }
+            wrapped = False
+            for wk in ("battle", "combat", "engagement"):
+                inner = ev.get(wk)
+                if isinstance(inner, dict):
+                    entry = dict(inner)
+                    entry.setdefault("date", date_key)
+                    battles.append(_parse_battle(entry))
+                    wrapped = True
+            if not wrapped:
+                entry = dict(ev)
+                entry.setdefault("date", date_key)
+                battles.append(_parse_battle(entry))
 
-    # Keep only meaningful battles.
-    return [b for b in battles if any([b.date, b.location, b.attacker, b.defender, b.attacker_losses, b.defender_losses])]
+    # Deduplicate and keep meaningful rows.
+    unique: List[Battle] = []
+    seen = set()
+    for b in battles:
+        sig = (b.date, b.location, b.attacker, b.defender, b.attacker_losses, b.defender_losses)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        if any(sig):
+            unique.append(b)
+    return unique
+
+
+def _looks_like_wargoal_dict(node: Dict[str, Any]) -> bool:
+    keys = {str(k).lower() for k in node.keys()}
+    if "wargoal" in " ".join(keys) or "casus_belli" in " ".join(keys):
+        return True
+    has_type = "type" in keys or "goal" in keys
+    has_actor = "added_by" in keys or "actor" in keys or "from" in keys
+    has_target = "target" in keys or "receiver" in keys or "to" in keys
+    return has_type and (has_actor or has_target)
+
+
+def _collect_wargoals(node: Dict[str, Any], history_events: List[Tuple[str, Dict[str, Any]]]) -> List[Wargoal]:
+    goals: List[Wargoal] = []
+
+    for w in _as_list(_first_non_empty(node, "wargoals", "wargoal", "casus_belli", "goals")):
+        if isinstance(w, dict):
+            for sub in _iter_dict_nodes(w):
+                if _looks_like_wargoal_dict(sub):
+                    goals.append(_parse_wargoal(sub))
+
+    if not goals:
+        for d in _iter_dict_nodes(node):
+            if _looks_like_wargoal_dict(d):
+                goals.append(_parse_wargoal(d))
+
+    # history entries like add_attacker_wargoal / add_defender_wargoal
+    for _date_key, ev in history_events:
+        for k, v in ev.items():
+            ks = str(k).lower()
+            if "wargoal" not in ks:
+                continue
+            if isinstance(v, dict):
+                # Some formats nest actual payload under "wargoal" key.
+                if isinstance(v.get("wargoal"), dict):
+                    goals.append(_parse_wargoal(v.get("wargoal")))
+                else:
+                    goals.append(_parse_wargoal(v))
+            else:
+                goals.append(Wargoal(war_goal_type=str(v), status="unknown"))
+
+    unique: List[Wargoal] = []
+    seen = set()
+    for g in goals:
+        sig = (g.added_by, g.target, g.war_goal_type, g.status)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        if g.war_goal_type or g.added_by or g.target:
+            unique.append(g)
+    return unique
 
 
 def extract_wars(root: Dict[str, Any]) -> List[War]:
@@ -482,16 +585,9 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
         if not attackers or not defenders:
             continue
 
-        history_events = _collect_history_dates(node.get("history"))
+        history_events = _collect_history_dates(node.get("history") if "history" in node else node)
         battles = _collect_war_battles(node, history_events)
-
-        wargoals: List[Wargoal] = []
-        for w in _as_list(_first_non_empty(node, "wargoals", "wargoal", "casus_belli", "goals")):
-            if isinstance(w, dict):
-                sub_values = list(w.values()) if any(isinstance(v, dict) for v in w.values()) else [w]
-                for item in sub_values:
-                    if isinstance(item, dict):
-                        wargoals.append(_parse_wargoal(item))
+        wargoals = _collect_wargoals(node, history_events)
 
         attacker_losses = _safe_int(
             _first_non_empty(node, "attacker_losses", "losses_attacker", "attackers_losses", "total_attacker_losses")
@@ -510,6 +606,13 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
         if defender_losses == 0:
             defender_losses = _sum_numeric_fields(node, r"(losses_defender|defender.*(loss|casualt|dead|killed|wounded))")
 
+        # Absolute fallback in modded saves with only generic casualty fields.
+        if attacker_losses == 0 and defender_losses == 0:
+            total_losses = _sum_numeric_fields(node, r"(loss|casualt|dead|killed|wounded)")
+            if total_losses:
+                attacker_losses = total_losses // 2
+                defender_losses = total_losses - attacker_losses
+
         start_date = _normalize_date(_first_non_empty(node, "start_date", "date", "war_start_date", "begin_date"))
         end_date = _normalize_date(_first_non_empty(node, "end_date", "peace_date", "war_end_date", "last_action_date"))
 
@@ -518,7 +621,11 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
         if not end_date:
             for date_key, ev in reversed(history_events):
                 ev_keys = {str(k).lower() for k in ev.keys()}
+                ev_blob = " ".join(list(ev_keys) + [str(v).lower() for v in ev.values()])
                 if any(k in ev_keys for k in ("rem_attacker", "rem_defender", "peace", "end_war", "winner", "victor")):
+                    end_date = date_key
+                    break
+                if "white_peace" in ev_blob or "status_quo" in ev_blob or "signed_peace" in ev_blob:
                     end_date = date_key
                     break
             if not end_date and history_events:
@@ -535,7 +642,7 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
             defenders=defenders,
             attacker_losses=attacker_losses,
             defender_losses=defender_losses,
-            outcome=_infer_outcome(node, history_events),
+            outcome=_infer_outcome(node, history_events, end_date),
             participants=participants,
             battles=battles,
             wargoals=wargoals,
