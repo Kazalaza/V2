@@ -359,7 +359,43 @@ def _find_war_candidates(node: Any, parent_key: str = "") -> List[Tuple[str, Dic
     return wars
 
 
+def _extract_country_tag(value: Any) -> str:
+    """Extract a likely country tag from scalar/list/dict values."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        m = re.search(r"\b([A-Z]{3})\b", value)
+        if m:
+            return m.group(1)
+        m = re.match(r"([A-Z]{3})[_-]", value)
+        if m:
+            return m.group(1)
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        for item in value:
+            tag = _extract_country_tag(item)
+            if tag:
+                return tag
+        return ""
+    if isinstance(value, dict):
+        for k in ("tag", "country", "who", "actor", "receiver", "from", "to", "attacker", "defender"):
+            if k in value:
+                tag = _extract_country_tag(value.get(k))
+                if tag:
+                    return tag
+        for v in value.values():
+            tag = _extract_country_tag(v)
+            if tag:
+                return tag
+    return ""
+
+
 def _parse_battle(node: Dict[str, Any]) -> Battle:
+    attacker_blob = _first_non_empty(node, "attacker", "attacking_country", "attacker_tag", "attacker_country")
+    defender_blob = _first_non_empty(node, "defender", "defending_country", "defender_tag", "defender_country")
+
     attacker_losses = _safe_int(
         _first_non_empty(node, "attacker_losses", "losses_attacker", "attackers_losses", "attacker_casualties")
     )
@@ -368,25 +404,36 @@ def _parse_battle(node: Dict[str, Any]) -> Battle:
     )
 
     if attacker_losses == 0:
-        attacker_losses = _sum_numeric_fields(node, r"attacker.*(loss|casualt|dead|killed|wounded)")
+        attacker_losses = _safe_int(_first_non_empty(node if isinstance(node, dict) else {}, "losses_attacker"))
+        attacker_losses += _sum_numeric_fields(attacker_blob, r"(loss|casualt|dead|killed|wounded)")
     if defender_losses == 0:
-        defender_losses = _sum_numeric_fields(node, r"defender.*(loss|casualt|dead|killed|wounded)")
+        defender_losses = _safe_int(_first_non_empty(node if isinstance(node, dict) else {}, "losses_defender"))
+        defender_losses += _sum_numeric_fields(defender_blob, r"(loss|casualt|dead|killed|wounded)")
+
+    winner_blob = _first_non_empty(node, "winner", "victor", "winner_country", "winner_tag")
+    winner = _extract_country_tag(winner_blob)
+    if not winner and isinstance(winner_blob, str):
+        low = winner_blob.lower()
+        if low == "attacker":
+            winner = _extract_country_tag(attacker_blob)
+        elif low == "defender":
+            winner = _extract_country_tag(defender_blob)
 
     return Battle(
         date=_normalize_date(_first_non_empty(node, "date", "battle_date", "start_date")),
-        location=str(node.get("location", node.get("province", node.get("name", "")))),
-        attacker=str(_first_non_empty(node, "attacker", "attacking_country", "attacker_tag") or ""),
-        defender=str(_first_non_empty(node, "defender", "defending_country", "defender_tag") or ""),
+        location=str(_first_non_empty(node, "location", "province", "province_id", "where") or ""),
+        attacker=_extract_country_tag(attacker_blob),
+        defender=_extract_country_tag(defender_blob),
         attacker_leader=str(node.get("attacker_leader", node.get("attacking_leader", ""))),
         defender_leader=str(node.get("defender_leader", node.get("defending_leader", ""))),
         attacker_losses=attacker_losses,
         defender_losses=defender_losses,
-        winner=str(_first_non_empty(node, "winner", "victor") or ""),
+        winner=winner,
     )
 
 
 def _parse_wargoal(node: Dict[str, Any]) -> Wargoal:
-    achieved = node.get("fulfilled", node.get("achieved", None))
+    achieved = _first_non_empty(node, "fulfilled", "achieved", "status")
     if isinstance(achieved, str):
         achieved_status = achieved
     elif achieved is None:
@@ -394,10 +441,11 @@ def _parse_wargoal(node: Dict[str, Any]) -> Wargoal:
     else:
         achieved_status = "achieved" if bool(achieved) else "failed"
 
+    goal_type = _first_non_empty(node, "type", "wargoal", "goal", "casus_belli", "cb")
     return Wargoal(
-        added_by=str(node.get("added_by", node.get("actor", ""))),
-        target=str(node.get("target", node.get("receiver", ""))),
-        war_goal_type=str(node.get("type", node.get("wargoal", ""))),
+        added_by=_extract_country_tag(_first_non_empty(node, "added_by", "actor", "from", "sender", "attacker")),
+        target=_extract_country_tag(_first_non_empty(node, "target", "receiver", "to", "recipient", "defender")),
+        war_goal_type=str(goal_type or ""),
         status=achieved_status,
     )
 
@@ -425,12 +473,10 @@ def _collect_history_dates(history_node: Any) -> List[Tuple[str, Dict[str, Any]]
                     out.append((k, {"value": v}))
 
     out.sort(key=lambda t: t[0])
-
-    # Deduplicate exact duplicates while preserving order.
     seen = set()
     unique: List[Tuple[str, Dict[str, Any]]] = []
     for date_key, ev in out:
-        key = (date_key, tuple(sorted(ev.keys())))
+        key = (date_key, tuple(sorted(str(k) for k in ev.keys())))
         if key in seen:
             continue
         seen.add(key)
@@ -467,7 +513,8 @@ def _infer_outcome(node: Dict[str, Any], history_events: List[Tuple[str, Dict[st
 
 def _looks_like_battle_dict(node: Dict[str, Any]) -> bool:
     keys = {str(k).lower() for k in node.keys()}
-    if "battle" in " ".join(keys) or "combat" in " ".join(keys):
+    joined = " ".join(keys)
+    if "battle" in joined or "combat" in joined:
         return True
     if ("attacker" in keys or "attacking_country" in keys) and ("defender" in keys or "defending_country" in keys):
         return True
@@ -479,17 +526,14 @@ def _looks_like_battle_dict(node: Dict[str, Any]) -> bool:
 def _collect_war_battles(node: Dict[str, Any], history_events: List[Tuple[str, Dict[str, Any]]]) -> List[Battle]:
     battles: List[Battle] = []
 
-    # Direct/known containers.
     for b in _as_list(_first_non_empty(node, "battles", "battle", "combat", "combats", "engagements", "fight")):
         if isinstance(b, dict):
             for sub in _iter_dict_nodes(b):
                 if _looks_like_battle_dict(sub):
                     battles.append(_parse_battle(sub))
 
-    # History events frequently contain battle snippets.
     for date_key, ev in history_events:
         if _looks_like_battle_dict(ev):
-            # Wrapper style: { battle={...} } / { combat={...} }
             wrapped = False
             for wk in ("battle", "combat", "engagement"):
                 inner = ev.get(wk)
@@ -503,7 +547,6 @@ def _collect_war_battles(node: Dict[str, Any], history_events: List[Tuple[str, D
                 entry.setdefault("date", date_key)
                 battles.append(_parse_battle(entry))
 
-    # Deduplicate and keep meaningful rows.
     unique: List[Battle] = []
     seen = set()
     for b in battles:
@@ -511,16 +554,17 @@ def _collect_war_battles(node: Dict[str, Any], history_events: List[Tuple[str, D
         if sig in seen:
             continue
         seen.add(sig)
-        if any(sig):
+        if b.attacker or b.defender or b.attacker_losses or b.defender_losses or b.location:
             unique.append(b)
     return unique
 
 
 def _looks_like_wargoal_dict(node: Dict[str, Any]) -> bool:
     keys = {str(k).lower() for k in node.keys()}
-    if "wargoal" in " ".join(keys) or "casus_belli" in " ".join(keys):
+    joined = " ".join(keys)
+    if "wargoal" in joined or "casus_belli" in joined:
         return True
-    has_type = "type" in keys or "goal" in keys
+    has_type = "type" in keys or "goal" in keys or "cb" in keys
     has_actor = "added_by" in keys or "actor" in keys or "from" in keys
     has_target = "target" in keys or "receiver" in keys or "to" in keys
     return has_type and (has_actor or has_target)
@@ -534,20 +578,15 @@ def _collect_wargoals(node: Dict[str, Any], history_events: List[Tuple[str, Dict
             for sub in _iter_dict_nodes(w):
                 if _looks_like_wargoal_dict(sub):
                     goals.append(_parse_wargoal(sub))
+        elif isinstance(w, str):
+            goals.append(Wargoal(war_goal_type=w, status="unknown"))
 
-    if not goals:
-        for d in _iter_dict_nodes(node):
-            if _looks_like_wargoal_dict(d):
-                goals.append(_parse_wargoal(d))
-
-    # history entries like add_attacker_wargoal / add_defender_wargoal
     for _date_key, ev in history_events:
         for k, v in ev.items():
             ks = str(k).lower()
-            if "wargoal" not in ks:
+            if "wargoal" not in ks and "casus_belli" not in ks and ks not in ("cb", "goal"):
                 continue
             if isinstance(v, dict):
-                # Some formats nest actual payload under "wargoal" key.
                 if isinstance(v.get("wargoal"), dict):
                     goals.append(_parse_wargoal(v.get("wargoal")))
                 else:
@@ -565,6 +604,21 @@ def _collect_wargoals(node: Dict[str, Any], history_events: List[Tuple[str, Dict
         if g.war_goal_type or g.added_by or g.target:
             unique.append(g)
     return unique
+
+
+def _collect_participants(node: Dict[str, Any], attackers: List[str], defenders: List[str], history_events: List[Tuple[str, Dict[str, Any]]]) -> List[str]:
+    participants = set(attackers + defenders + _extract_country_list(node.get("participants")))
+    participants.update(_extract_country_list(_first_non_empty(node, "attacker_allies", "defender_allies", "allies")))
+
+    for _date, ev in history_events:
+        for key in ("add_attacker", "add_defender", "call_attacker", "call_defender", "join_attacker", "join_defender"):
+            if key in ev:
+                participants.update(_extract_country_list(ev.get(key)))
+                tag = _extract_country_tag(ev.get(key))
+                if tag:
+                    participants.add(tag)
+
+    return sorted(x for x in participants if x)
 
 
 def extract_wars(root: Dict[str, Any]) -> List[War]:
@@ -606,13 +660,6 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
         if defender_losses == 0:
             defender_losses = _sum_numeric_fields(node, r"(losses_defender|defender.*(loss|casualt|dead|killed|wounded))")
 
-        # Absolute fallback in modded saves with only generic casualty fields.
-        if attacker_losses == 0 and defender_losses == 0:
-            total_losses = _sum_numeric_fields(node, r"(loss|casualt|dead|killed|wounded)")
-            if total_losses:
-                attacker_losses = total_losses // 2
-                defender_losses = total_losses - attacker_losses
-
         start_date = _normalize_date(_first_non_empty(node, "start_date", "date", "war_start_date", "begin_date"))
         end_date = _normalize_date(_first_non_empty(node, "end_date", "peace_date", "war_end_date", "last_action_date"))
 
@@ -631,7 +678,7 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
             if not end_date and history_events:
                 end_date = history_events[-1][0]
 
-        participants = sorted(set(attackers + defenders + _extract_country_list(node.get("participants"))))
+        participants = _collect_participants(node, attackers, defenders, history_events)
 
         war = War(
             key=f"{parent_key or 'war'}_{i}",
@@ -687,6 +734,36 @@ class CountryResolver:
         return self.tag_to_name.get(tag, tag)
 
 
+class ProvinceResolver:
+    def __init__(self) -> None:
+        self.id_to_name: Dict[str, str] = {}
+
+    def load_from_game_dir(self, game_dir: Path) -> None:
+        self.id_to_name.clear()
+        definition = game_dir / "map" / "definition.csv"
+        if not definition.exists():
+            return
+        try:
+            with definition.open("r", encoding="cp1252", errors="ignore") as f:
+                for line in f:
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.strip().split(";")
+                    if len(parts) >= 5 and parts[0].isdigit():
+                        pid = parts[0].strip()
+                        pname = parts[4].strip()
+                        if pname:
+                            self.id_to_name[pid] = pname
+        except OSError:
+            return
+
+    def resolve(self, value: str) -> str:
+        s = str(value).strip()
+        if s.isdigit() and s in self.id_to_name:
+            return self.id_to_name[s]
+        return s
+
+
 class FlagCache:
     def __init__(self) -> None:
         self._cache: Dict[str, Any] = {}
@@ -734,6 +811,7 @@ class Vic2WarAnalyzerApp(tk.Tk):
         self.filtered_wars: List[War] = []
 
         self.country_resolver = CountryResolver()
+        self.province_resolver = ProvinceResolver()
         self.flag_cache = FlagCache()
 
         self._build_ui()
@@ -861,6 +939,7 @@ class Vic2WarAnalyzerApp(tk.Tk):
             if p.exists():
                 self.game_dir = p
                 self.country_resolver.load_from_game_dir(p)
+                self.province_resolver.load_from_game_dir(p)
                 self.flag_cache.set_game_dir(p)
 
     def _load_config(self) -> Dict[str, Any]:
@@ -908,6 +987,7 @@ class Vic2WarAnalyzerApp(tk.Tk):
         p = Path(d)
         self.game_dir = p
         self.country_resolver.load_from_game_dir(p)
+        self.province_resolver.load_from_game_dir(p)
         self.flag_cache.set_game_dir(p)
         self.config_data["game_dir"] = str(p)
         self._save_config()
@@ -1091,7 +1171,12 @@ class Vic2WarAnalyzerApp(tk.Tk):
             attacker = self.country_resolver.resolve(b.attacker)
             defender = self.country_resolver.resolve(b.defender)
             winner = self.country_resolver.resolve(b.winner)
-            row = [b.date, b.location, attacker, defender, b.attacker_losses, b.defender_losses, winner]
+            if b.winner and b.winner.lower() == "attacker":
+                winner = attacker
+            elif b.winner and b.winner.lower() == "defender":
+                winner = defender
+            location = self.province_resolver.resolve(b.location)
+            row = [b.date, location, attacker, defender, b.attacker_losses, b.defender_losses, winner]
             if q and q not in " | ".join(map(str, row)).lower():
                 continue
             self.battles_tree.insert("", tk.END, iid=str(i), values=row)
