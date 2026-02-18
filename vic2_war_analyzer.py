@@ -15,15 +15,13 @@ from __future__ import annotations
 
 import csv
 import gzip
-import io
 import json
-import os
 import re
 import sys
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -254,18 +252,98 @@ def _safe_int(v: Any) -> int:
     return 0
 
 
+def _normalize_date(value: Any) -> str:
+    """Normalize save date values into a readable `YYYY.M.D` string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [str(x) for x in value if x is not None]
+        return ".".join(parts)
+    if isinstance(value, dict):
+        # Some structures store dates as year/month/day blocks.
+        y = value.get("year")
+        m = value.get("month")
+        d = value.get("day")
+        if y is not None and m is not None and d is not None:
+            return f"{y}.{m}.{d}"
+        # Other blocks keep anonymous values in __items__.
+        if "__items__" in value:
+            return _normalize_date(value.get("__items__"))
+    return str(value)
+
+
+def _sum_numeric_fields(node: Any, include_pattern: str) -> int:
+    """Recursively sum numeric fields whose keys match include_pattern."""
+    total = 0
+    pat = re.compile(include_pattern, re.IGNORECASE)
+
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(v, (dict, list)):
+                total += _sum_numeric_fields(v, include_pattern)
+                continue
+            if pat.search(str(k)):
+                total += _safe_int(v)
+    elif isinstance(node, list):
+        for item in node:
+            total += _sum_numeric_fields(item, include_pattern)
+    return total
+
+
+def _first_non_empty(node: Dict[str, Any], *keys: str) -> Any:
+    for k in keys:
+        val = node.get(k)
+        if val not in (None, "", [], {}):
+            return val
+    return None
+
+
+def _format_war_name(node: Dict[str, Any], attackers: List[str], defenders: List[str], index: int) -> str:
+    name = _first_non_empty(node, "name", "war_name", "localized_name", "cb_name")
+    if isinstance(name, str) and name.strip() and not re.fullmatch(r"war\s*\d+", name.strip(), re.IGNORECASE):
+        return name
+
+    # Build a descriptive fallback name from sides and first wargoal if available.
+    wg_type = ""
+    for src in _as_list(_first_non_empty(node, "wargoals", "casus_belli")):
+        if isinstance(src, dict):
+            if "type" in src:
+                wg_type = str(src.get("type") or "")
+                break
+            for sv in src.values():
+                if isinstance(sv, dict) and sv.get("type"):
+                    wg_type = str(sv.get("type") or "")
+                    break
+        if wg_type:
+            break
+
+    left = attackers[0] if attackers else "Unknown"
+    right = defenders[0] if defenders else "Unknown"
+    if wg_type:
+        return f"{left} vs {right} ({wg_type})"
+    return f"{left} vs {right}"
+
+
 def _find_war_candidates(node: Any, parent_key: str = "") -> List[Tuple[str, Dict[str, Any]]]:
     """Recursively collect objects that look like wars."""
     wars: List[Tuple[str, Dict[str, Any]]] = []
     if isinstance(node, dict):
         keys = set(node.keys())
-        looks_like_war = bool(
-            {"attackers", "defenders"}.issubset(keys)
-            or {"original_attacker", "original_defender"}.issubset(keys)
-            or "battles" in keys
+        attackers_present = "attackers" in keys or "original_attacker" in keys
+        defenders_present = "defenders" in keys or "original_defender" in keys
+        war_context = (
+            "war" in parent_key.lower()
             or "wargoals" in keys
             or "casus_belli" in keys
+            or "battle" in keys
+            or "is_great_war" in keys
+            or "war_exhaustion" in keys
         )
+        looks_like_war = bool(attackers_present and defenders_present and war_context)
         if looks_like_war:
             wars.append((parent_key, node))
 
@@ -282,15 +360,26 @@ def _find_war_candidates(node: Any, parent_key: str = "") -> List[Tuple[str, Dic
 
 
 def _parse_battle(node: Dict[str, Any]) -> Battle:
+    attacker_losses = _safe_int(
+        _first_non_empty(node, "attacker_losses", "losses_attacker", "attackers_losses", "attacker_casualties")
+    )
+    defender_losses = _safe_int(
+        _first_non_empty(node, "defender_losses", "losses_defender", "defenders_losses", "defender_casualties")
+    )
+    if attacker_losses == 0:
+        attacker_losses = _sum_numeric_fields(node.get("attacker", {}), r"(loss|casualt|dead|killed)")
+    if defender_losses == 0:
+        defender_losses = _sum_numeric_fields(node.get("defender", {}), r"(loss|casualt|dead|killed)")
+
     return Battle(
-        date=str(node.get("date", "")),
+        date=_normalize_date(_first_non_empty(node, "date", "battle_date", "start_date")),
         location=str(node.get("location", node.get("province", ""))),
         attacker=str(node.get("attacker", node.get("attacking_country", ""))),
         defender=str(node.get("defender", node.get("defending_country", ""))),
         attacker_leader=str(node.get("attacker_leader", node.get("attacking_leader", ""))),
         defender_leader=str(node.get("defender_leader", node.get("defending_leader", ""))),
-        attacker_losses=_safe_int(node.get("attacker_losses", node.get("losses_attacker", 0))),
-        defender_losses=_safe_int(node.get("defender_losses", node.get("losses_defender", 0))),
+        attacker_losses=attacker_losses,
+        defender_losses=defender_losses,
         winner=str(node.get("winner", "")),
     )
 
@@ -325,11 +414,13 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
             continue
         unique_ids.add(uid)
 
-        attackers = _extract_country_list(node.get("attackers", node.get("original_attacker")))
-        defenders = _extract_country_list(node.get("defenders", node.get("original_defender")))
+        attackers = _extract_country_list(_first_non_empty(node, "attackers", "original_attacker", "attacker"))
+        defenders = _extract_country_list(_first_non_empty(node, "defenders", "original_defender", "defender"))
+        if not attackers or not defenders:
+            continue
 
         battles: List[Battle] = []
-        for b in _as_list(node.get("battles")):
+        for b in _as_list(_first_non_empty(node, "battles", "combat", "engagements")):
             if isinstance(b, dict):
                 # battles can be dict of battle_id -> battle_data
                 sub_values = list(b.values()) if any(isinstance(v, dict) for v in b.values()) else [b]
@@ -338,29 +429,37 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
                         battles.append(_parse_battle(item))
 
         wargoals: List[Wargoal] = []
-        for w in _as_list(node.get("wargoals", node.get("casus_belli"))):
+        for w in _as_list(_first_non_empty(node, "wargoals", "casus_belli", "goals")):
             if isinstance(w, dict):
                 sub_values = list(w.values()) if any(isinstance(v, dict) for v in w.values()) else [w]
                 for item in sub_values:
                     if isinstance(item, dict):
                         wargoals.append(_parse_wargoal(item))
 
-        attacker_losses = _safe_int(node.get("attacker_losses", node.get("losses_attacker", 0)))
-        defender_losses = _safe_int(node.get("defender_losses", node.get("losses_defender", 0)))
+        attacker_losses = _safe_int(
+            _first_non_empty(node, "attacker_losses", "losses_attacker", "attackers_losses", "total_attacker_losses")
+        )
+        defender_losses = _safe_int(
+            _first_non_empty(node, "defender_losses", "losses_defender", "defenders_losses", "total_defender_losses")
+        )
 
         # If not directly present, estimate losses from battles.
         if attacker_losses == 0 and battles:
             attacker_losses = sum(b.attacker_losses for b in battles)
         if defender_losses == 0 and battles:
             defender_losses = sum(b.defender_losses for b in battles)
+        if attacker_losses == 0:
+            attacker_losses = _sum_numeric_fields(node, r"attacker.*(loss|casualt|dead|killed)|losses_attacker")
+        if defender_losses == 0:
+            defender_losses = _sum_numeric_fields(node, r"defender.*(loss|casualt|dead|killed)|losses_defender")
 
         participants = sorted(set(attackers + defenders + _extract_country_list(node.get("participants"))))
 
         war = War(
             key=f"{parent_key or 'war'}_{i}",
-            name=str(node.get("name", node.get("war_name", f"War {i}"))),
-            start_date=str(node.get("start_date", node.get("date", ""))),
-            end_date=str(node.get("end_date", node.get("peace_date", ""))),
+            name=_format_war_name(node, attackers, defenders, i),
+            start_date=_normalize_date(_first_non_empty(node, "start_date", "date", "war_start_date", "begin_date")),
+            end_date=_normalize_date(_first_non_empty(node, "end_date", "peace_date", "war_end_date", "last_action_date")),
             attackers=attackers,
             defenders=defenders,
             attacker_losses=attacker_losses,
@@ -371,11 +470,11 @@ def extract_wars(root: Dict[str, Any]) -> List[War]:
             wargoals=wargoals,
         )
 
-        # If name is empty, construct one from sides.
-        if not war.name or war.name.strip() in ("", "0"):
-            an = war.attackers[0] if war.attackers else "Unknown"
-            dn = war.defenders[0] if war.defenders else "Unknown"
-            war.name = f"{an} vs {dn}"
+        if war.start_date in ("", "0"):
+            for battle in war.battles:
+                if battle.date:
+                    war.start_date = battle.date
+                    break
 
         wars.append(war)
 
