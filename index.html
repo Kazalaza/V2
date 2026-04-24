@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Victoria II Modern Launcher</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Cinzel:wght@500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">V2</span>
+          <div>
+            <h1>Victoria II Launcher</h1>
+            <p>Modern command deck</p>
+          </div>
+        </div>
+
+        <section class="card">
+          <h2>Game Directory</h2>
+          <button id="pickGameDirBtn" class="btn btn-secondary">Pick Victoria II Folder</button>
+          <p id="gameDirLabel" class="muted">Not selected</p>
+          <div class="meta-grid">
+            <div>
+              <label>Version</label>
+              <span id="gameVersion">Unknown</span>
+            </div>
+            <div>
+              <label>Checksum</label>
+              <span id="gameChecksum">N/A</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Presets</h2>
+          <div class="preset-row">
+            <input id="presetNameInput" type="text" placeholder="Preset name" />
+            <button id="savePresetBtn" class="btn btn-secondary">Save</button>
+          </div>
+          <div class="preset-row">
+            <select id="presetSelect"></select>
+            <button id="loadPresetBtn" class="btn btn-secondary">Load</button>
+          </div>
+          <div class="preset-row compact">
+            <button id="deletePresetBtn" class="btn btn-ghost">Delete</button>
+            <label class="toggle-wrap">
+              <input id="autoloadLastPreset" type="checkbox" />
+              Auto-load last preset
+            </label>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Launch Options</h2>
+          <label class="checkline"><input type="checkbox" id="windowed" /> Windowed mode</label>
+          <label class="checkline"><input type="checkbox" id="borderless" /> Borderless window</label>
+          <div class="grid-two">
+            <label>Width<input id="resWidth" type="number" min="640" placeholder="1920" /></label>
+            <label>Height<input id="resHeight" type="number" min="480" placeholder="1080" /></label>
+          </div>
+          <label>Extra args<input id="extraArgs" type="text" placeholder="-skiplauncher ..." /></label>
+          <button id="launchBtn" class="btn btn-primary">Launch Victoria II</button>
+          <p class="muted tiny">In web mode this emits a launch payload for your host app.</p>
+        </section>
+      </aside>
+
+      <main class="main-panel">
+        <header class="toolbar card">
+          <div class="search-wrap">
+            <input id="modSearch" type="search" placeholder="Search mods, tags, descriptions" />
+          </div>
+          <div class="toolbar-actions">
+            <select id="filterState">
+              <option value="all">All Mods</option>
+              <option value="enabled">Enabled</option>
+              <option value="disabled">Disabled</option>
+              <option value="conflicts">Conflicts</option>
+            </select>
+            <button id="scanModsBtn" class="btn btn-secondary">Scan Mods</button>
+          </div>
+        </header>
+
+        <section class="mods card">
+          <div class="mods-header">
+            <h2>Installed Mods</h2>
+            <p id="modsSummary" class="muted">0 mods loaded</p>
+          </div>
+          <ul id="modList" class="mod-list"></ul>
+          <div id="emptyState" class="empty-state">
+            <h3>No mods detected</h3>
+            <p>Select your Victoria II folder and click “Scan Mods”.</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <template id="modTemplate">
+      <li class="mod-item" draggable="true">
+        <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
+        <img class="mod-icon" alt="mod icon" />
+        <div class="mod-meta">
+          <div class="mod-title-line">
+            <label class="switch" title="Enable or disable mod">
+              <input type="checkbox" class="mod-toggle" />
+              <span class="slider"></span>
+            </label>
+            <h3 class="mod-name"></h3>
+            <span class="tag conflict-tag hidden">Conflict</span>
+          </div>
+          <p class="mod-description muted"></p>
+          <div class="mod-footer">
+            <code class="mod-id"></code>
+            <span class="mod-deps muted tiny"></span>
+          </div>
+        </div>
+      </li>
+    </template>
+
+    <script src="app.js" type="module"></script>
+  </body>
+</html>
