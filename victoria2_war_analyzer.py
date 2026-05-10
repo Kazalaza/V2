@@ -11,9 +11,13 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import mimetypes
 import os
 import re
 import sys
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -186,10 +190,15 @@ class Country:
 class Battle:
     name: str
     date: str = ""
+    location: str = ""
     attacker: str = ""
     defender: str = ""
+    attacker_leader: str = ""
+    defender_leader: str = ""
     attacker_losses: int = 0
     defender_losses: int = 0
+    attacker_army: Dict[str, int] = field(default_factory=dict)
+    defender_army: Dict[str, int] = field(default_factory=dict)
     winner: str = ""
 
     @property
@@ -390,6 +399,29 @@ def extract_battle_loss(data: Dict[str, Any], side: str) -> int:
     return 0
 
 
+
+
+def side_details(data: Dict[str, Any], side: str) -> Tuple[str, str, Dict[str, int]]:
+    side_data = data.get(side)
+    nodes = side_data if isinstance(side_data, list) else [side_data]
+    for node in nodes:
+        if isinstance(node, dict):
+            tags = as_tag_list(node.get("country") or node.get("tag") or node)
+            leader = str(first_scalar(node.get("leader")) or "")
+            army: Dict[str, int] = {}
+            for key, value in node.items():
+                if key in {"country", "tag", "leader", "losses", "casualties", "dead"}:
+                    continue
+                if isinstance(value, (int, float)):
+                    army[key] = int(value)
+            return (tags[0] if tags else "", leader, army)
+    return "", "", {}
+
+
+def date_from_line(line: str) -> str:
+    match = DATE_RE.search(line)
+    return match.group(0) if match else ""
+
 def extract_battles(war_data: Dict[str, Any]) -> List[Battle]:
     battles: List[Battle] = []
     containers: List[Any] = []
@@ -398,17 +430,24 @@ def extract_battles(war_data: Dict[str, Any]) -> List[Battle]:
     for idx, item in enumerate(containers, 1):
         if not isinstance(item, dict):
             continue
+        attacker, attacker_leader, attacker_army = side_details(item, "attacker")
+        defender, defender_leader, defender_army = side_details(item, "defender")
         attackers = as_tag_list(item.get("attacker") or item.get("attackers"))
         defenders = as_tag_list(item.get("defender") or item.get("defenders"))
         battles.append(
             Battle(
-                name=str(item.get("name") or item.get("province") or f"Battle {idx}"),
+                name=str(item.get("name") or item.get("province") or item.get("location") or f"Battle {idx}"),
                 date=str(item.get("date") or item.get("start_date") or ""),
-                attacker=attackers[0] if attackers else str(item.get("attacker", "")),
-                defender=defenders[0] if defenders else str(item.get("defender", "")),
+                location=str(item.get("location") or item.get("province") or ""),
+                attacker=attacker or (attackers[0] if attackers else str(item.get("attacker", ""))),
+                defender=defender or (defenders[0] if defenders else str(item.get("defender", ""))),
+                attacker_leader=attacker_leader,
+                defender_leader=defender_leader,
                 attacker_losses=extract_battle_loss(item, "attacker"),
                 defender_losses=extract_battle_loss(item, "defender"),
-                winner=str(item.get("winner", "")),
+                attacker_army=attacker_army,
+                defender_army=defender_army,
+                winner=str(item.get("winner") or item.get("result") or ""),
             )
         )
     return battles
@@ -458,7 +497,40 @@ def value_after_equals(line: str) -> str:
 
 def tag_from_line_value(line: str) -> str:
     value = value_after_equals(line)
-    return value if COUNTRY_TAG.match(value) else ""
+    if COUNTRY_TAG.match(value):
+        return value
+    match = re.search(r'"?([A-Z0-9]{3})"?', value)
+    return match.group(1) if match else ""
+
+
+def parse_int_value(line: str) -> int:
+    try:
+        return int(float(value_after_equals(line)))
+    except ValueError:
+        return 0
+
+
+def is_unit_line(line: str) -> bool:
+    if "=" not in line or "{" in line or "}" in line:
+        return False
+    key = line.split("=", 1)[0].strip()
+    return key not in {"country", "tag", "leader", "losses", "casualties", "dead", "name", "date", "result", "location"}
+
+
+def add_unique(target: List[str], tag: str) -> None:
+    if tag and tag != "---" and tag not in target:
+        target.append(tag)
+
+
+def finalize_war_dates(war: War) -> War:
+    if not war.start_date:
+        dated = sorted(
+            (b.date for b in war.battles if parse_date(b.date)),
+            key=lambda d: parse_date(d) or date.max,
+        )
+        if dated:
+            war.start_date = dated[0]
+    return war
 
 
 def extract_wars_from_lines(text: str) -> List[War]:
@@ -481,6 +553,9 @@ def extract_wars_from_lines(text: str) -> List[War]:
     pending_war = False
     pending_battle = False
     pending_side: Optional[str] = None
+    pending_participant_side: Optional[str] = None
+    participant_side: Optional[str] = None
+    participant_depth = 0
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -506,8 +581,12 @@ def extract_wars_from_lines(text: str) -> List[War]:
         if in_battle and battle is not None:
             if line.startswith("name="):
                 battle.name = value_after_equals(line)
-            elif line.startswith("location=") and not battle.name:
-                battle.name = value_after_equals(line)
+            elif line.startswith("date="):
+                battle.date = value_after_equals(line)
+            elif line.startswith("location="):
+                battle.location = value_after_equals(line)
+                if not battle.name:
+                    battle.name = battle.location
             elif line.startswith("result="):
                 battle.winner = "attacker" if value_after_equals(line) == "yes" else "defender"
             elif line.startswith("attacker=") or line.startswith("defender=") or (pending_side and line.startswith("{")):
@@ -536,15 +615,25 @@ def extract_wars_from_lines(text: str) -> List[War]:
                     battle.attacker = tag
                 elif tag and side == "defender":
                     battle.defender = tag
+            elif side and line.startswith("leader="):
+                if side == "attacker":
+                    battle.attacker_leader = value_after_equals(line)
+                else:
+                    battle.defender_leader = value_after_equals(line)
             elif side and line.startswith("losses="):
-                try:
-                    losses = int(float(value_after_equals(line)))
-                except ValueError:
-                    losses = 0
+                losses = parse_int_value(line)
                 if side == "attacker":
                     battle.attacker_losses = losses
                 else:
                     battle.defender_losses = losses
+            elif side and is_unit_line(line):
+                unit = line.split("=", 1)[0].strip()
+                count = parse_int_value(line)
+                if count:
+                    if side == "attacker":
+                        battle.attacker_army[unit] = count
+                    else:
+                        battle.defender_army[unit] = count
             if side:
                 side_depth += delta if not (line.startswith("attacker=") or line.startswith("defender=")) else 0
                 if side_depth <= 0 and "}" in line:
@@ -576,49 +665,81 @@ def extract_wars_from_lines(text: str) -> List[War]:
                 battle = None
                 in_battle = False
             continue
+        if pending_participant_side and line.startswith("{"):
+            participant_side = pending_participant_side
+            pending_participant_side = None
+            participant_depth = delta
+            war_depth += delta
+            continue
+        if participant_side:
+            if line.startswith("country=") or line.startswith("tag="):
+                if participant_side == "attacker":
+                    add_unique(current.attackers, tag_from_line_value(line))
+                else:
+                    add_unique(current.defenders, tag_from_line_value(line))
+            participant_depth += delta
+            war_depth += delta
+            if participant_depth <= 0 and "}" in line:
+                participant_side = None
+                participant_depth = 0
+            continue
+
+        if "date=" in line and not current.start_date:
+            current.start_date = date_from_line(line) or value_after_equals(line)
         if line.startswith("name="):
             current.name = value_after_equals(line)
         elif line.startswith("start_date=") or line.startswith("date="):
             if not current.start_date:
-                current.start_date = value_after_equals(line)
-        elif line.startswith("attacker="):
+                current.start_date = date_from_line(line) or value_after_equals(line)
+        elif line.startswith("attacker=") or line.startswith("add_attacker=") or line.startswith("original_attacker="):
             tag = tag_from_line_value(line)
-            if tag and tag not in current.attackers:
-                current.attackers.append(tag)
-        elif line.startswith("defender="):
+            add_unique(current.attackers, tag)
+            if not tag and "{" not in line:
+                pending_participant_side = "attacker"
+            elif not tag and "{" in line:
+                participant_side = "attacker"
+                participant_depth = delta
+        elif line.startswith("defender=") or line.startswith("add_defender=") or line.startswith("original_defender="):
             tag = tag_from_line_value(line)
-            if tag and tag not in current.defenders:
-                current.defenders.append(tag)
+            add_unique(current.defenders, tag)
+            if not tag and "{" not in line:
+                pending_participant_side = "defender"
+            elif not tag and "{" in line:
+                participant_side = "defender"
+                participant_depth = delta
 
         war_depth += delta
         if war_depth <= 0:
-            wars.append(current)
+            wars.append(finalize_war_dates(current))
             current = None
             in_war = False
             war_depth = 0
     if current is not None:
-        wars.append(current)
+        wars.append(finalize_war_dates(current))
     return wars
 
 
 def merge_line_war_data(wars: List[War], line_wars: List[War]) -> List[War]:
     if not line_wars:
         return wars
-    if not wars or sum(w.casualties for w in wars) == 0:
+    if not wars:
         return line_wars
     for i, line_war in enumerate(line_wars):
         if i >= len(wars):
             wars.append(line_war)
             continue
         parsed = wars[i]
-        if parsed.casualties == 0 and line_war.casualties:
+        if line_war.name and (not parsed.name or parsed.name.startswith("War ")):
+            parsed.name = line_war.name
+        if line_war.casualties and (parsed.casualties == 0 or len(line_war.battles) >= len(parsed.battles)):
             parsed.battles = line_war.battles
-        if not parsed.attackers:
-            parsed.attackers = line_war.attackers
-        if not parsed.defenders:
-            parsed.defenders = line_war.defenders
+        for tag in line_war.attackers:
+            add_unique(parsed.attackers, tag)
+        for tag in line_war.defenders:
+            add_unique(parsed.defenders, tag)
         if not parsed.start_date:
             parsed.start_date = line_war.start_date
+        finalize_war_dates(parsed)
     return wars
 
 
@@ -1026,6 +1147,115 @@ def autodetect_game_dir() -> Optional[Path]:
     return None
 
 
+
+# ----------------------------- browser UI -----------------------------
+def ppm_to_bmp(ppm: bytes) -> bytes:
+    header, rest = ppm.split(b"\n", 3)[0:3], ppm.split(b"\n", 3)[3]
+    width, height = map(int, header[1].split())
+    row_pad = (4 - (width * 3) % 4) % 4
+    pixel_rows = []
+    for y in range(height - 1, -1, -1):
+        start = y * width * 3
+        row = bytearray()
+        for x in range(width):
+            r, g, b = rest[start + x * 3 : start + x * 3 + 3]
+            row.extend([b, g, r])
+        row.extend(b"\x00" * row_pad)
+        pixel_rows.append(bytes(row))
+    pixel_data = b"".join(pixel_rows)
+    file_size = 54 + len(pixel_data)
+    return (
+        b"BM"
+        + file_size.to_bytes(4, "little")
+        + b"\x00\x00\x00\x00"
+        + (54).to_bytes(4, "little")
+        + (40).to_bytes(4, "little")
+        + width.to_bytes(4, "little")
+        + height.to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (24).to_bytes(2, "little")
+        + (0).to_bytes(4, "little")
+        + len(pixel_data).to_bytes(4, "little")
+        + (2835).to_bytes(4, "little")
+        + (2835).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + (0).to_bytes(4, "little")
+        + pixel_data
+    )
+
+
+def flag_data_uri(art: ArtLoader, tag: str, government: str = "") -> str:
+    path = art.find_flag(tag, government)
+    if not path:
+        return ""
+    try:
+        if path.suffix.lower() == ".tga":
+            bmp = ppm_to_bmp(tga_to_ppm(path, (72, 48)))
+            return "data:image/bmp;base64," + base64.b64encode(bmp).decode("ascii")
+        mime = mimetypes.guess_type(str(path))[0] or "image/png"
+        return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+    except Exception:
+        return ""
+
+
+def web_payload(analysis: Analysis, art: ArtLoader) -> Dict[str, Any]:
+    payload = to_jsonable(analysis)
+    payload["flags"] = {
+        tag: flag_data_uri(art, tag, country.government)
+        for tag, country in analysis.countries.items()
+    }
+    return payload
+
+
+def render_web_app(analysis: Analysis, art: ArtLoader) -> str:
+    data = json.dumps(web_payload(analysis, art)).replace("</", "<\\/")
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Victoria II War Analyzer</title>
+<style>
+:root{--bg:#0b1020;--panel:#121a2c;--panel2:#19243a;--text:#edf3ff;--muted:#91a0b8;--gold:#e1b866;--red:#ef6b73;--blue:#71a7ff;--green:#70d99b;--line:#29364f}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#23375f 0,#0b1020 42%,#070a12 100%);color:var(--text);font:14px/1.45 Inter,Segoe UI,system-ui,sans-serif}.app{display:grid;grid-template-columns:320px 1fr;min-height:100vh}.side{border-right:1px solid var(--line);background:rgba(9,13,24,.82);backdrop-filter:blur(12px);padding:24px;position:sticky;top:0;height:100vh;overflow:auto}.brand{font-size:28px;font-weight:900;letter-spacing:-.04em;color:var(--gold);margin-bottom:6px}.sub{color:var(--muted);margin-bottom:22px}.statgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}.stat{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:18px;padding:14px}.stat b{display:block;font-size:22px}.stat span{font-size:11px;color:var(--muted);letter-spacing:.08em}.warbtn{width:100%;text-align:left;background:rgba(255,255,255,.04);color:var(--text);border:1px solid var(--line);border-radius:14px;margin:8px 0;padding:12px;cursor:pointer}.warbtn.active{border-color:var(--gold);box-shadow:0 0 0 1px rgba(225,184,102,.35) inset}.main{padding:28px 34px 50px;overflow:auto}.hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px}.hero h1{font-size:34px;line-height:1.05;margin:0 0 8px}.pill{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--line);background:rgba(255,255,255,.05);padding:8px 11px;border-radius:999px;color:var(--muted)}.cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}.card{background:rgba(18,26,44,.86);border:1px solid var(--line);border-radius:22px;padding:18px;box-shadow:0 18px 60px rgba(0,0,0,.28)}.sideTitle{font-weight:800;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px}.nation{display:flex;align-items:center;gap:12px;padding:8px;border-radius:12px}.flag{width:54px;height:36px;border-radius:6px;object-fit:cover;background:linear-gradient(135deg,#31486f,#d5b56a);border:1px solid rgba(255,255,255,.2)}.tag{font-weight:800}.muted{color:var(--muted)}.balance{height:20px;background:var(--red);border-radius:999px;overflow:hidden;border:1px solid var(--line)}.balance span{display:block;height:100%;background:var(--blue)}.toolbar{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:18px 0}.toolbar input,.toolbar select{background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:12px;padding:10px 12px}table{width:100%;border-collapse:separate;border-spacing:0 8px}th{text-align:left;color:var(--muted);font-size:12px;letter-spacing:.07em;text-transform:uppercase;padding:0 12px;cursor:pointer}td{background:rgba(18,26,44,.88);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:12px}td:first-child{border-left:1px solid var(--line);border-radius:14px 0 0 14px}td:last-child{border-right:1px solid var(--line);border-radius:0 14px 14px 0}.row{cursor:pointer}.row:hover td{background:#1d2a44}.detail{position:fixed;right:24px;bottom:24px;width:min(520px,calc(100vw - 48px));max-height:72vh;overflow:auto;background:#10192b;border:1px solid var(--gold);border-radius:24px;padding:20px;box-shadow:0 30px 100px rgba(0,0,0,.55);display:none}.detail.open{display:block}.close{float:right;background:transparent;color:var(--muted);border:0;font-size:22px;cursor:pointer}.army{display:grid;grid-template-columns:1fr 1fr;gap:12px}.mini{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:14px;padding:12px}@media(max-width:850px){.app{grid-template-columns:1fr}.side{position:static;height:auto}.cards{grid-template-columns:1fr}.hero{display:block}}
+</style>
+</head><body><div class="app"><aside class="side"><div class="brand">Victoria II<br>War Analyzer</div><div class="sub">Browser war room with sortable battles and commander details.</div><div class="statgrid"><div class="stat"><b id="saveDate">—</b><span>SAVE DATE</span></div><div class="stat"><b id="warCount">—</b><span>WARS</span></div><div class="stat"><b id="lossCount">—</b><span>LOSSES</span></div><div class="stat"><b id="countryCount">—</b><span>COUNTRIES</span></div></div><div id="wars"></div></aside><main class="main"><section class="hero"><div><h1 id="warName">Select a war</h1><div class="muted" id="warMeta"></div></div><div class="pill" id="lossPill">0 losses</div></section><section class="cards"><div class="card"><div class="sideTitle" style="color:var(--blue)">Attackers</div><div id="attackers"></div></div><div class="card"><div class="sideTitle" style="color:var(--red)">Defenders</div><div id="defenders"></div></div></section><section class="card"><div class="sideTitle">Casualty Balance</div><div class="balance"><span id="balanceBar"></span></div><div class="muted" id="balanceText" style="margin-top:8px"></div></section><section class="card" style="margin-top:16px"><div class="toolbar"><strong>Battle Ledger</strong><input id="filter" placeholder="Filter battles, commanders, tags…"><select id="sort"><option value="losses-desc">Losses ↓</option><option value="losses-asc">Losses ↑</option><option value="date-asc">Date ↑</option><option value="date-desc">Date ↓</option><option value="name-asc">Name A-Z</option></select></div><table><thead><tr><th data-sort="name-asc">Battle</th><th data-sort="date-asc">Date</th><th>Commanders</th><th data-sort="losses-desc">Losses</th><th>Winner</th></tr></thead><tbody id="battleRows"></tbody></table></section></main></div><aside id="detail" class="detail"></aside><script id="payload" type="application/json">__DATA__</script><script>
+const data=JSON.parse(document.getElementById('payload').textContent);let current=0;let sort='losses-desc';const fmt=n=>(n||0).toLocaleString();const country=t=>data.countries[t]||{tag:t,name:t,military_score:0,prestige:0,government:''};function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function nation(tag){const c=country(tag);const src=data.flags[tag]||'';const flag=src?`<img class="flag" src="${src}">`:`<div class="flag"></div>`;return `<div class="nation">${flag}<div><div class="tag">${esc(tag)} ${esc(c.name&&c.name!==tag?'· '+c.name:'')}</div><div class="muted">Mil ${fmt(c.military_score)} · Prestige ${fmt(c.prestige)}${c.government?' · '+esc(c.government):''}</div></div></div>`}function renderWars(){document.getElementById('saveDate').textContent=data.date||'Unknown';document.getElementById('warCount').textContent=data.wars.length;document.getElementById('countryCount').textContent=Object.keys(data.countries).length;document.getElementById('lossCount').textContent=fmt(data.wars.reduce((a,w)=>a+w.casualties,0));document.getElementById('wars').innerHTML=data.wars.map((w,i)=>`<button class="warbtn ${i===current?'active':''}" onclick="current=${i};render()"><b>${esc(w.name)}</b><br><span class="muted">${esc(w.start_date||'Unknown start')} · ${fmt(w.casualties)} losses</span></button>`).join('')}function sortedBattles(w){const q=document.getElementById('filter').value.toLowerCase();let rows=[...w.battles].filter(b=>JSON.stringify(b).toLowerCase().includes(q));const [k,dir]=sort.split('-');rows.sort((a,b)=>{let av=k==='losses'?a.total_losses:(a[k]||''),bv=k==='losses'?b.total_losses:(b[k]||'');if(k==='date'){av=av||'9999.99.99';bv=bv||'9999.99.99'}return (av>bv?1:av<bv?-1:0)*(dir==='desc'?-1:1)});return rows}function showBattle(i){const b=sortedBattles(data.wars[current])[i];const d=document.getElementById('detail');const army=o=>Object.entries(o||{}).map(([k,v])=>`<div>${esc(k)}: <b>${fmt(v)}</b></div>`).join('')||'<span class="muted">No army composition in save</span>';d.innerHTML=`<button class="close" onclick="detail.classList.remove('open')">×</button><h2>${esc(b.name)}</h2><p class="muted">${esc(b.date||'Unknown date')} ${b.location?'· Province '+esc(b.location):''}</p><div class="army"><div class="mini"><b style="color:var(--blue)">${esc(b.attacker||'Unknown attacker')}</b><br>Commander: ${esc(b.attacker_leader||'Unknown')}<br>Losses: ${fmt(b.attacker_losses)}<hr>${army(b.attacker_army)}</div><div class="mini"><b style="color:var(--red)">${esc(b.defender||'Unknown defender')}</b><br>Commander: ${esc(b.defender_leader||'Unknown')}<br>Losses: ${fmt(b.defender_losses)}<hr>${army(b.defender_army)}</div></div><p><b>Winner:</b> ${esc(b.winner||'Unknown')}</p>`;d.classList.add('open')}function renderBattles(w){const rows=sortedBattles(w);document.getElementById('battleRows').innerHTML=rows.map((b,i)=>`<tr class="row" onclick="showBattle(${i})"><td><b>${esc(b.name)}</b><br><span class="muted">${esc(b.attacker||'Unknown')} vs ${esc(b.defender||'Unknown')}</span></td><td>${esc(b.date||'Unknown')}</td><td>${esc(b.attacker_leader||'Unknown')}<br><span class="muted">vs ${esc(b.defender_leader||'Unknown')}</span></td><td><b>${fmt(b.total_losses)}</b><br><span class="muted">${fmt(b.attacker_losses)} / ${fmt(b.defender_losses)}</span></td><td>${esc(b.winner||'Unknown')}</td></tr>`).join('')||'<tr><td colspan="5">No battle records found.</td></tr>'}function render(){renderWars();const w=data.wars[current]||{attackers:[],defenders:[],battles:[],casualties:0};document.getElementById('warName').textContent=w.name||'Unknown war';document.getElementById('warMeta').textContent=`Started ${w.start_date||'Unknown'} · ${w.battles.length} battles`;document.getElementById('lossPill').textContent=fmt(w.casualties)+' known losses';document.getElementById('attackers').innerHTML=w.attackers.map(nation).join('')||'<span class="muted">No attackers found</span>';document.getElementById('defenders').innerHTML=w.defenders.map(nation).join('')||'<span class="muted">No defenders found</span>';const al=w.attacker_losses||0,dl=w.defender_losses||0,total=Math.max(1,al+dl);document.getElementById('balanceBar').style.width=(al/total*100)+'%';document.getElementById('balanceText').textContent=`Attackers lost ${fmt(al)} · Defenders lost ${fmt(dl)}`;renderBattles(w)}document.getElementById('filter').addEventListener('input',()=>renderBattles(data.wars[current]));document.getElementById('sort').addEventListener('change',e=>{sort=e.target.value;renderBattles(data.wars[current])});document.querySelectorAll('th[data-sort]').forEach(th=>th.onclick=()=>{sort=th.dataset.sort;document.getElementById('sort').value=sort;renderBattles(data.wars[current])});render();
+</script></body></html>""".replace("__DATA__", data)
+
+
+def run_web_app(save_path: Path, game_dir: Optional[Path], port: int, open_browser: bool = True) -> None:
+    analysis = analyze(save_path)
+    art = ArtLoader([p for p in [game_dir, autodetect_game_dir()] if p])
+    page = render_web_app(analysis, art).encode("utf-8")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path not in ("/", "/index.html"):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = f"http://127.0.0.1:{server.server_port}/"
+    print(f"{APP_TITLE} running at {url}")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+    finally:
+        server.server_close()
+
+
 # ----------------------------- CLI -----------------------------
 def to_jsonable(analysis: Analysis) -> Dict[str, Any]:
     return {
@@ -1041,7 +1271,7 @@ def to_jsonable(analysis: Analysis) -> Dict[str, Any]:
                 "casualties": w.casualties,
                 "attacker_losses": w.side_losses()[0],
                 "defender_losses": w.side_losses()[1],
-                "battles": [battle.__dict__ for battle in w.battles],
+                "battles": [dict(battle.__dict__, total_losses=battle.total_losses) for battle in w.battles],
             }
             for w in analysis.wars
         ],
@@ -1073,6 +1303,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--game-dir", type=Path, help="Victoria II install/mod folder for flags")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of launching the GUI")
     parser.add_argument("--summary", action="store_true", help="Print a terminal summary instead of launching the GUI")
+    parser.add_argument("--web", action="store_true", help="Launch the modern browser UI")
+    parser.add_argument("--port", type=int, default=8765, help="Port for --web (default: 8765)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not automatically open a browser for --web")
     args = parser.parse_args(argv)
 
     if args.json or args.summary:
@@ -1083,6 +1316,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(to_jsonable(analysis), indent=2, sort_keys=True))
         else:
             print_summary(analysis)
+        return 0
+
+    if args.web:
+        if not args.save:
+            parser.error("--web requires a save path")
+        run_web_app(args.save, args.game_dir, args.port, not args.no_browser)
         return 0
 
     app = AnalyzerApp(args.save, args.game_dir)
